@@ -1,15 +1,23 @@
 package main
 
 import (
-	"html/template"
 	"net/http"
 
 	"github.com/gin-gonic/gin"
-	"github.com/j-briant/extract-service/authentication"
-	"github.com/j-briant/extract-service/extraction"
+
+	extraction "github.com/j-briant/extract-service/cmd/geometry"
+	"github.com/j-briant/extract-service/cmd/web"
 )
 
-var secretKey = []byte("supersecretkey")
+var secretKey = "supersecretkey"
+
+type User struct {
+	Username string `json:"username"`
+	Password string `json:"password"`
+}
+
+var users = make(map[string]User)
+var blacklist = make(map[string]bool)
 
 func main() {
 	// Create a new Gin router
@@ -20,20 +28,30 @@ func main() {
 		c.String(http.StatusOK, "Hello, World!")
 	})
 
-	// Load the registration form HTML template
-	htmlTemplate := template.Must(template.ParseFiles("html/register.html"))
-
-	// Add a registration route
-	router.GET("/register", func(c *gin.Context) {
-		htmlTemplate.Execute(c.Writer, nil)
+	// Define the /home route
+	router.GET("/home", func(c *gin.Context) {
+		// Render the homepage HTML template
+		c.JSON(http.StatusOK, gin.H{"message": "Welcome on /home."})
 	})
 
-	router.POST("/register", authentication.SubmitRegistrationHandler)
+	// Login user route
+	router.POST("/login", web.SigninHandler)
 
-	// Add a protected route
-	authorized := router.Group("/extract-vector")
-	authorized.Use(authentication.AuthMiddleware(string(secretKey)))
-	authorized.GET("/", extraction.VectorExtraction)
+	// Register user route
+	router.POST("/register", web.SignupHandler)
+
+	// Post parameters route
+	router.POST("/extraction", extraction.VectorExtraction)
+
+	// Add protected routes
+	auth := router.Group("/")
+	auth.Use(web.AuthMiddleware(secretKey))
+	{
+		auth.GET("/logout", web.LogoutHandler)
+		auth.GET("/protected-route", func(c *gin.Context) {
+			c.JSON(http.StatusOK, gin.H{"message": "You have access to a protected route."})
+		})
+	}
 
 	// Start the server and listen for incoming HTTP requests
 	if err := router.Run(":8080"); err != nil {

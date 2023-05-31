@@ -4,19 +4,31 @@ import (
 	"encoding/csv"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
+	"net/url"
 	"os"
 	"regexp"
 	"strings"
 
+	"github.com/airbusgeo/godal"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 )
 
-type URLParameters struct {
+type RequestParameters struct {
 	Product    string `json:"product" binding:"required"`
 	Perimeter  string `json:"perimeter" binding:"required"`
 	Parameters string `json:"parameters" binding:"required"`
+}
+
+type WFSRequestParameters struct {
+	BaseURL   string
+	OGCServer string
+	Service   string
+	Version   string
+	Request   string
+	TypeNames []string
 }
 
 type SpatialFilter struct {
@@ -76,7 +88,7 @@ func GetCSVLine(productUUID uuid.UUID, csvpath string) (UUIDCSV, error) {
 
 		// If uuid matches return the line.
 		if recUUID == productUUID {
-			return UUIDCSV{recUUID.String(), strings.Split(rec[headerMap["tables"]], ",")}, nil
+			return UUIDCSV{recUUID.String(), strings.Split(rec[headerMap["tables"]], " ")}, nil
 		}
 
 	}
@@ -103,10 +115,10 @@ func WKTToWFSFilter(wkt string) (SpatialFilter, error) {
 }
 
 func VectorExtraction(c *gin.Context) {
-	// Create URLParameters object
-	var urlparam URLParameters
+	// Create URLParameters object.
+	var urlparam RequestParameters
 
-	// Get the url parameters
+	// Get the url parameters.
 	err := c.BindJSON(&urlparam)
 
 	if err != nil {
@@ -114,70 +126,135 @@ func VectorExtraction(c *gin.Context) {
 		return
 	}
 
-	spatialf, err := WKTToWFSFilter(urlparam.Perimeter)
-
+	// Get spatial filter info.
+	//spatialf, err := WKTToWFSFilter(urlparam.Perimeter)
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
 
-	c.JSON(http.StatusOK, spatialf)
-
-	/*perimeterStr := c.Query("perimeter")
-
-	// Parse the perimeter value as a geometry
-	perimeter, err := gdal.CreateFromWKT(perimeterStr, gdal.CreateSpatialReference("EPSG:4326"))
+	// Parse the receivedd UUID, error if not parsable.
+	productUUID, err := uuid.Parse(urlparam.Product)
 	if err != nil {
-		c.String(http.StatusBadRequest, "Invalid perimeter value.")
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
 
-	// Open the vector layer using gdal
-	dataset := gdal.OpenDataSource("data/test-points.shp", 0)
+	// Read the configuration csv and return the corresponding line.
+	productTable, err := GetCSVLine(productUUID, "tests/extract.csv")
 	if err != nil {
-		c.String(http.StatusInternalServerError, "Could not open vector layer.")
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
-	defer dataset.Destroy()
 
-	// Get the layer from the dataset
-	layer := dataset.LayerByIndex(0)
+	// Create the WFSRequestParameters objet
+	var wfsrequests []url.URL
+	wfsrequestparam := WFSRequestParameters{
+		BaseURL:   "https://map.lausanne.ch/mapserv_proxy",
+		OGCServer: "source for image/png",
+		Service:   "wfs",
+		Version:   "2.0.0",
+		Request:   "GetFeature",
+		TypeNames: productTable.Tables,
+	}
 
-	// Create a spatial filter to select features based on the perimeter geometry
-	layer.SetSpatialFilter(perimeter)
-
-	// Create a feature array to hold the selected features
-
-	features := make([]string, 0)
-
-	// Loop over the features in the layer and add the selected ones to the feature array
-	//layer.ResetReading()
-	feature := layer.NextFeature()
-	for feature != nil {
-
-		// Fetch Geometry of feature
-		geometry := feature.Geometry()
-
-		// Convert Geomtry to WKT
-		geometryWKT, err := geometry.ToWKT()
-
+	for _, value := range productTable.Tables {
+		baseUrl, err := url.Parse(wfsrequestparam.BaseURL)
 		if err != nil {
-			c.String(http.StatusInternalServerError, "Could not get geometry.")
+			fmt.Println("Malformed URL: ", err.Error())
 			return
 		}
 
-		// Add the feature to the feature array
-		features = append(features, geometryWKT)
+		// Prepare Query Parameters
+		params := url.Values{}
+		params.Add("ogcserver", wfsrequestparam.OGCServer)
+		params.Add("service", wfsrequestparam.Service)
+		params.Add("version", wfsrequestparam.Version)
+		params.Add("request", wfsrequestparam.Request)
+		params.Add("ogcserver", wfsrequestparam.OGCServer)
+		params.Add("typenames", value)
 
-		// Get the next feature
-		feature = layer.NextFeature()
+		// Add Query Parameters to the URL
+		baseUrl.RawQuery = params.Encode()
+
+		wfsrequests = append(wfsrequests, *baseUrl)
 	}
 
-	// Print the number of selected features
-	fmt.Printf("Selected %d features.\n", len(features))
+	result, err := http.Get(wfsrequests[0].String())
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
 
-	// Return the selected features as JSON
-	c.JSON(http.StatusOK, gin.H{
-		"features": features,
-	})*/
+	defer result.Body.Close()
+
+	// Read GML data from the response body
+	b, _ := io.ReadAll(result.Body)
+
+	// Open new file and write data into gml format
+	gmlFile := "tests/response.gml"
+	err = os.WriteFile(gmlFile, b, 0644)
+
+	err = godal.RegisterVector("GML")
+	err = godal.RegisterVector("ESRI Shapefile")
+	//gmlDriver, ok := godal.VectorDriver(gmlDriverName)
+
+	// Open the GML file
+	ds, err := godal.Open(gmlFile, godal.VectorOnly())
+	if err != nil {
+		log.Fatalf("Failed to open file: %v", err)
+	}
+	defer ds.Close()
+
+	// Get the GML layer
+	layers := ds.Layers()
+	if len(layers) == 0 {
+		log.Fatal("File does not contain any layers")
+	}
+	layer := layers[0]
+	layerType := layer.Type()
+	layerSrs := layer.SpatialRef()
+	layerName := layer.Name()
+
+	// Create a new Shapefile
+	driver := godal.DriverName("ESRI Shapefile")
+
+	shapefileDS, err := godal.CreateVector(driver, "tests/output.shp")
+	if err != nil {
+		log.Fatal("Can't create output dataset.")
+	}
+	defer shapefileDS.Close()
+
+	// Get fields
+	fields := layer.NextFeature().Fields()
+	var fieldDefinitions []godal.CreateLayerOption
+	for key, field := range fields {
+		fmt.Printf("%s: %+v\n", key, field)
+		fieldDefinitions = append(fieldDefinitions, godal.NewFieldDefinition(key, field.Type()))
+		if err != nil {
+			log.Fatal("Can't create fields.")
+		}
+	}
+
+	// Create a new layer in the Shapefile
+	shapefileLayer, err := shapefileDS.CreateLayer(layerName, layerSrs, layerType, fieldDefinitions...)
+	if err != nil {
+		log.Fatalf("Failed to set geometry: %v", err)
+	}
+
+	// Copy features from the GML layer to the Shapefile layer
+	layer.ResetReading()
+	for {
+		feature := layer.NextFeature()
+		if feature == nil {
+			break
+		}
+
+		err = shapefileLayer.CreateFeature(feature)
+		if err != nil {
+			log.Fatal("Can't create feature.")
+		}
+
+		feature.Close()
+	}
 }

@@ -29,6 +29,7 @@ type WFSRequestParameters struct {
 	Version   string
 	Request   string
 	TypeNames []string
+	Filter    string
 }
 
 type SpatialFilter struct {
@@ -97,21 +98,50 @@ func GetCSVLine(productUUID uuid.UUID, csvpath string) (UUIDCSV, error) {
 	return UUIDCSV{}, fmt.Errorf("Couldn't find the requested UUID %s, data not available.", productUUID.String())
 }
 
-func WKTToWFSFilter(wkt string) (SpatialFilter, error) {
+func WKTToWFSFilter(wkt string) (string, error) {
+	xmlTemplate := `
+	<fes:Filter
+	xmlns:fes="http://www.opengis.net/fes/2.0"
+	xmlns:gml="http://www.opengis.net/gml/3.2">
+	<fes:Not>
+		<fes:Disjoint>
+			<fes:ValueReference>sf:the_geom</fes:ValueReference>
+			<gml:Polygon
+					gml:id="polygon.1"
+					srsName='http://www.opengis.net/def/crs/EPSG/0/$my_srs'>
+				<gml:exterior>
+					<gml:LinearRing>
+						<gml:posList>$my_filter</gml:posList>
+					</gml:LinearRing>
+				</gml:exterior>
+			</gml:Polygon>
+		</fes:Disjoint>
+	</fes:Not>
+	</fes:Filter>`
+
 	r := regexp.MustCompile(`((SRID=(?P<SRID>\d{4});)*(?P<GeometryType>[A-Za-z]*) *\(\((?P<Coordinates>.*)\)\))`)
 	matches := r.FindStringSubmatch(wkt)
 
 	if matches != nil {
-		return SpatialFilter{
-			matches[r.SubexpIndex("SRID")],
-			matches[r.SubexpIndex("GeometryType")],
-			matches[r.SubexpIndex("Coordinates")]}, nil
+		var srid string
+		if matches[r.SubexpIndex("SRID")] == "" {
+			srid = "2056"
+		} else {
+			srid = matches[r.SubexpIndex("SRID")]
+		}
+
+		// Format the filter XML
+		trimmedCoordinates := strings.Trim(matches[r.SubexpIndex("Coordinates")], "()")
+		trimmedCoordinates = strings.ReplaceAll(trimmedCoordinates, ",", "")
+		res := strings.Replace(xmlTemplate, "$my_srs", srid, 1)
+		res = strings.Replace(res, "$my_filter", trimmedCoordinates, 1)
+		return res, nil
 	}
 
 	// Create the error message
 	errMsg := fmt.Errorf("The provided (E)WKT (%s) is invalid, make sure that this is a polygon.", wkt)
 
-	return SpatialFilter{}, errMsg
+	return "", errMsg
 }
 
 func VectorExtraction(c *gin.Context) {
@@ -127,7 +157,7 @@ func VectorExtraction(c *gin.Context) {
 	}
 
 	// Get spatial filter info.
-	//spatialf, err := WKTToWFSFilter(urlparam.Perimeter)
+	spatialf, err := WKTToWFSFilter(urlparam.Perimeter)
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
@@ -156,6 +186,7 @@ func VectorExtraction(c *gin.Context) {
 		Version:   "2.0.0",
 		Request:   "GetFeature",
 		TypeNames: productTable.Tables,
+		Filter:    spatialf,
 	}
 
 	for _, value := range productTable.Tables {
@@ -171,8 +202,8 @@ func VectorExtraction(c *gin.Context) {
 		params.Add("service", wfsrequestparam.Service)
 		params.Add("version", wfsrequestparam.Version)
 		params.Add("request", wfsrequestparam.Request)
-		params.Add("ogcserver", wfsrequestparam.OGCServer)
 		params.Add("typenames", value)
+		params.Add("filter", wfsrequestparam.Filter)
 
 		// Add Query Parameters to the URL
 		baseUrl.RawQuery = params.Encode()
@@ -195,8 +226,8 @@ func VectorExtraction(c *gin.Context) {
 	gmlFile := "tests/response.gml"
 	err = os.WriteFile(gmlFile, b, 0644)
 
-	err = godal.RegisterVector("GML")
-	err = godal.RegisterVector("ESRI Shapefile")
+	vectorFormats := []godal.DriverName{"GML", "ESRI Shapefile"}
+	err = godal.RegisterVector(vectorFormats...)
 	//gmlDriver, ok := godal.VectorDriver(gmlDriverName)
 
 	// Open the GML file
@@ -229,7 +260,6 @@ func VectorExtraction(c *gin.Context) {
 	fields := layer.NextFeature().Fields()
 	var fieldDefinitions []godal.CreateLayerOption
 	for key, field := range fields {
-		fmt.Printf("%s: %+v\n", key, field)
 		fieldDefinitions = append(fieldDefinitions, godal.NewFieldDefinition(key, field.Type()))
 		if err != nil {
 			log.Fatal("Can't create fields.")
@@ -257,4 +287,6 @@ func VectorExtraction(c *gin.Context) {
 
 		feature.Close()
 	}
+
+	c.JSON(http.StatusOK, gin.H{"filter": spatialf})
 }

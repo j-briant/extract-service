@@ -99,25 +99,18 @@ func GetCSVLine(productUUID uuid.UUID, csvpath string) (UUIDCSV, error) {
 }
 
 func WKTToWFSFilter(wkt string) (string, error) {
-	xmlTemplate := `
-	<fes:Filter
-	xmlns:fes="http://www.opengis.net/fes/2.0"
-	xmlns:gml="http://www.opengis.net/gml/3.2">
-	<fes:Not>
-		<fes:Disjoint>
-			<fes:ValueReference>sf:the_geom</fes:ValueReference>
-			<gml:Polygon
-					gml:id="polygon.1"
-					srsName='http://www.opengis.net/def/crs/EPSG/0/$my_srs'>
+	xmlTemplate := `<ogc:Filter>
+		<ogc:Intersects>
+			<ogc:PropertyName>ms:Geometry</ogc:PropertyName>
+			<gml:Polygon srsName='http://www.opengis.net/def/crs/EPSG/0/$my_srs'>
 				<gml:exterior>
 					<gml:LinearRing>
 						<gml:posList>$my_filter</gml:posList>
 					</gml:LinearRing>
 				</gml:exterior>
 			</gml:Polygon>
-		</fes:Disjoint>
-	</fes:Not>
-	</fes:Filter>`
+		</ogc:Intersects>
+	</ogc:Filter>`
 
 	r := regexp.MustCompile(`((SRID=(?P<SRID>\d{4});)*(?P<GeometryType>[A-Za-z]*) *\(\((?P<Coordinates>.*)\)\))`)
 	matches := r.FindStringSubmatch(wkt)
@@ -132,7 +125,7 @@ func WKTToWFSFilter(wkt string) (string, error) {
 
 		// Format the filter XML
 		trimmedCoordinates := strings.Trim(matches[r.SubexpIndex("Coordinates")], "()")
-		trimmedCoordinates = strings.ReplaceAll(trimmedCoordinates, ",", "")
+		//trimmedCoordinates = strings.ReplaceAll(trimmedCoordinates, ",", "")
 		res := strings.Replace(xmlTemplate, "$my_srs", srid, 1)
 		res = strings.Replace(res, "$my_filter", trimmedCoordinates, 1)
 		return res, nil
@@ -203,7 +196,7 @@ func VectorExtraction(c *gin.Context) {
 		params.Add("version", wfsrequestparam.Version)
 		params.Add("request", wfsrequestparam.Request)
 		params.Add("typenames", value)
-		params.Add("filter", wfsrequestparam.Filter)
+		//params.Add("filter", wfsrequestparam.Filter)
 
 		// Add Query Parameters to the URL
 		baseUrl.RawQuery = params.Encode()
@@ -211,81 +204,85 @@ func VectorExtraction(c *gin.Context) {
 		wfsrequests = append(wfsrequests, *baseUrl)
 	}
 
-	result, err := http.Get(wfsrequests[0].String())
-	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
-		return
-	}
+	fmt.Printf("%+v\n", wfsrequests)
 
-	defer result.Body.Close()
-
-	// Read GML data from the response body
-	b, _ := io.ReadAll(result.Body)
-
-	// Open new file and write data into gml format
-	gmlFile := "tests/response.gml"
-	err = os.WriteFile(gmlFile, b, 0644)
-
-	vectorFormats := []godal.DriverName{"GML", "ESRI Shapefile"}
-	err = godal.RegisterVector(vectorFormats...)
-	//gmlDriver, ok := godal.VectorDriver(gmlDriverName)
-
-	// Open the GML file
-	ds, err := godal.Open(gmlFile, godal.VectorOnly())
-	if err != nil {
-		log.Fatalf("Failed to open file: %v", err)
-	}
-	defer ds.Close()
-
-	// Get the GML layer
-	layers := ds.Layers()
-	if len(layers) == 0 {
-		log.Fatal("File does not contain any layers")
-	}
-	layer := layers[0]
-	layerType := layer.Type()
-	layerSrs := layer.SpatialRef()
-	layerName := layer.Name()
-
-	// Create a new Shapefile
-	driver := godal.DriverName("ESRI Shapefile")
-
-	shapefileDS, err := godal.CreateVector(driver, "tests/output.shp")
-	if err != nil {
-		log.Fatal("Can't create output dataset.")
-	}
-	defer shapefileDS.Close()
-
-	// Get fields
-	fields := layer.NextFeature().Fields()
-	var fieldDefinitions []godal.CreateLayerOption
-	for key, field := range fields {
-		fieldDefinitions = append(fieldDefinitions, godal.NewFieldDefinition(key, field.Type()))
+	for _, value := range wfsrequests {
+		result, err := http.Get(value.String())
 		if err != nil {
-			log.Fatal("Can't create fields.")
-		}
-	}
-
-	// Create a new layer in the Shapefile
-	shapefileLayer, err := shapefileDS.CreateLayer(layerName, layerSrs, layerType, fieldDefinitions...)
-	if err != nil {
-		log.Fatalf("Failed to set geometry: %v", err)
-	}
-
-	// Copy features from the GML layer to the Shapefile layer
-	layer.ResetReading()
-	for {
-		feature := layer.NextFeature()
-		if feature == nil {
-			break
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+			return
 		}
 
-		err = shapefileLayer.CreateFeature(feature)
+		defer result.Body.Close()
+
+		// Read GML data from the response body
+		b, _ := io.ReadAll(result.Body)
+
+		// Open new file and write data into gml format
+		gmlFile := fmt.Sprintf("tests/%s", strings.ReplaceAll(value.Query().Get("typenames"), ":", "_"))
+		err = os.WriteFile(gmlFile, b, 0644)
+
+		vectorFormats := []godal.DriverName{"GML", "ESRI Shapefile"}
+		err = godal.RegisterVector(vectorFormats...)
+
+		// Open the GML file
+		ds, err := godal.Open(gmlFile, godal.VectorOnly())
 		if err != nil {
-			log.Fatal("Can't create feature.")
+			log.Fatalf("Failed to open file: %v", err)
+		}
+		defer ds.Close()
+
+		// Get the GML layer
+		layers := ds.Layers()
+		if len(layers) == 0 {
+			log.Fatal("File does not contain any layers")
+		}
+		layer := layers[0]
+		layerType := layer.Type()
+		layerSrs := layer.SpatialRef()
+		layerName := layer.Name()
+
+		// Create a new Shapefile
+		driver := godal.DriverName("ESRI Shapefile")
+
+		outputPath := fmt.Sprintf("tests/%s.shp", strings.ReplaceAll(value.Query().Get("typenames"), ":", "_"))
+		shapefileDS, err := godal.CreateVector(driver, outputPath)
+		if err != nil {
+			log.Fatal("Can't create output dataset.")
+		}
+		defer shapefileDS.Close()
+
+		// Get fields
+		fields := layer.NextFeature().Fields()
+		var fieldDefinitions []godal.CreateLayerOption
+		for key, field := range fields {
+			fieldDefinitions = append(fieldDefinitions, godal.NewFieldDefinition(key, field.Type()))
+			if err != nil {
+				log.Fatal("Can't create fields.")
+			}
 		}
 
-		feature.Close()
+		// Create a new layer in the Shapefile
+		shapefileLayer, err := shapefileDS.CreateLayer(layerName, layerSrs, layerType, fieldDefinitions...)
+		if err != nil {
+			log.Fatalf("Failed to set geometry: %v", err)
+		}
+
+		// Copy features from the GML layer to the Shapefile layer
+		layer.ResetReading()
+		for {
+			feature := layer.NextFeature()
+			if feature == nil {
+				break
+			}
+
+			err = shapefileLayer.CreateFeature(feature)
+			if err != nil {
+				log.Fatal("Can't create feature.")
+			}
+
+			feature.Close()
+		}
 	}
 
 	c.JSON(http.StatusOK, gin.H{"filter": spatialf})
